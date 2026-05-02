@@ -1,17 +1,26 @@
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Wire.h>
+
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_LSM303_U.h>
-#include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
+#include <Adafruit_Sensor.h>
 
+// WiFi access point
+const char* ssid = "ESP32-DRONE";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// Sensors
 Adafruit_MPU6050 mpu;
 Adafruit_LSM303_Mag_Unified mag = Adafruit_LSM303_Mag_Unified(30302);
-Adafruit_BMP280 bmp;   // BMP280 object
-
+Adafruit_BMP280 bmp;
 
 // ESC pins
-#define FL 25
-#define FR 26
+#define FL 18
+#define FR 19
 #define RL 27
 #define RR 14
 
@@ -19,24 +28,24 @@ Adafruit_BMP280 bmp;   // BMP280 object
 #define PWM_RES 16
 
 #define MIN_US 1000
-#define MAX_US 2000
+#define MAX_US 1500   // safe test range
 
+int throttle = 1000;
+int pitch = 0;       // NEW control variable
 
-float roll, pitch, yaw;
+float roll, yaw;
 float altitude;
 float groundAltitude;
 
-int throttle = 1000;
 
-
-// Convert microseconds to duty cycle
+// Convert ESC microseconds → PWM duty
 uint32_t usToDuty(int us)
 {
   return map(us, 1000, 2000, 3276, 6553);
 }
 
 
-// Write ESC signal safely
+// Write motor safely
 void writeMotor(int pin, int us)
 {
   us = constrain(us, MIN_US, MAX_US);
@@ -44,40 +53,89 @@ void writeMotor(int pin, int us)
 }
 
 
-// Apply outputs
+// Motor mixing
 void updateMotors()
 {
-  writeMotor(FL, throttle);
-  writeMotor(FR, throttle);
-  writeMotor(RL, throttle);
-  writeMotor(RR, throttle);
+  int FL_out = throttle - pitch;
+  int FR_out = throttle - pitch;
+  int RL_out = throttle + pitch;
+  int RR_out = throttle + pitch;
+
+  writeMotor(FL, FL_out);
+  writeMotor(FR, FR_out);
+  writeMotor(RL, RL_out);
+  writeMotor(RR, RR_out);
 }
 
 
-// Calculate orientation
-void computeAngles()
+// Webpage UI
+String webpage = R"====(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+button{width:140px;height:60px;font-size:18px;margin:10px;}
+</style>
+</head>
+
+<body align="center">
+
+<h2>ESP32 Drone Controller 🚁</h2>
+
+<button onclick="send('throttle_up')">Throttle +</button>
+<button onclick="send('throttle_down')">Throttle -</button>
+
+<br><br>
+
+<button onclick="send('forward')">Forward</button>
+<button onclick="send('backward')">Backward</button>
+
+<br><br>
+
+<button onclick="send('stop')">STOP</button>
+
+<script>
+function send(cmd)
 {
-  sensors_event_t a, g, temp;
-  sensors_event_t mag_event;
+ fetch("/control?cmd="+cmd);
+}
+</script>
 
-  mpu.getEvent(&a, &g, &temp);
-  mag.getEvent(&mag_event);
+</body>
+</html>
+)====";
 
-  roll  = atan2(a.acceleration.y, a.acceleration.z) * 57.3;
 
-  pitch = atan2(-a.acceleration.x,
-          sqrt(a.acceleration.y * a.acceleration.y +
-               a.acceleration.z * a.acceleration.z)) * 57.3;
-
-  yaw = atan2(mag_event.magnetic.y,
-              mag_event.magnetic.x) * 57.3;
+// Serve webpage
+void handleRoot()
+{
+  server.send(200, "text/html", webpage);
 }
 
 
-// Calculate altitude relative to ground
-void computeAltitude()
+// Handle commands
+void handleControl()
 {
-  altitude = bmp.readAltitude(1013.25) - groundAltitude;
+  String cmd = server.arg("cmd");
+
+  if(cmd == "throttle_up") throttle += 5;
+  if(cmd == "throttle_down") throttle -= 5;
+
+  if(cmd == "forward") pitch = 40;
+  if(cmd == "backward") pitch = -40;
+
+  if(cmd == "stop")
+  {
+    throttle = 1000;
+    pitch = 0;
+  }
+
+  throttle = constrain(throttle, MIN_US, MAX_US);
+
+  updateMotors();
+
+  server.send(200,"text/plain","OK");
 }
 
 
@@ -87,21 +145,18 @@ void setup()
 
   Wire.begin(21,22);
 
-  // MPU6050 init
   if(!mpu.begin())
   {
     Serial.println("MPU6050 failed");
     while(1);
   }
 
-  // Compass init
   if(!mag.begin())
   {
     Serial.println("Compass failed");
     while(1);
   }
 
-  // BMP280 init
   if(!bmp.begin(0x76))
   {
     if(!bmp.begin(0x77))
@@ -111,16 +166,13 @@ void setup()
     }
   }
 
-  Serial.println("BMP280 ready");
+  Serial.println("Sensors ready");
 
-  // Capture ground altitude reference
   delay(2000);
+
   groundAltitude = bmp.readAltitude(1013.25);
 
-  Serial.print("Ground altitude reference: ");
-  Serial.println(groundAltitude);
-
-
+  // Attach ESC PWM
   ledcAttach(FL, PWM_FREQ, PWM_RES);
   ledcAttach(FR, PWM_FREQ, PWM_RES);
   ledcAttach(RL, PWM_FREQ, PWM_RES);
@@ -128,7 +180,6 @@ void setup()
 
   Serial.println("ESC arming...");
 
-  // SAFE ARMING SEQUENCE
   for(int i=0;i<300;i++)
   {
     updateMotors();
@@ -136,27 +187,31 @@ void setup()
   }
 
   Serial.println("ESC ready");
+
+  WiFi.softAP(ssid, password);
+
+  Serial.print("Connect WiFi: ");
+  Serial.println(ssid);
+
+  Serial.print("Open browser: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/control", handleControl);
+
+  server.begin();
 }
 
 
 void loop()
 {
-  computeAngles();
-  computeAltitude();
+  server.handleClient();
 
-  Serial.print("Roll: ");
-  Serial.print(roll);
+  Serial.print("Throttle: ");
+  Serial.print(throttle);
 
   Serial.print(" Pitch: ");
-  Serial.print(pitch);
+  Serial.println(pitch);
 
-  Serial.print(" Yaw: ");
-  Serial.print(yaw);
-
-  Serial.print(" Altitude(m): ");
-  Serial.println(altitude);
-
-  updateMotors();
-
-  delay(50);
+  delay(100);
 }
