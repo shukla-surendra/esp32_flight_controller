@@ -81,7 +81,7 @@ button{width:140px;height:60px;font-size:18px;margin:10px;}
 
 <body align="center">
 
-<h2>ESP32 Drone Controller 🚁</h2>
+<h2>ESP32 Drone Controller</h2>
 
 <button onclick="send('throttle_up')">Throttle +</button>
 <button onclick="send('throttle_down')">Throttle -</button>
