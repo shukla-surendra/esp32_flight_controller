@@ -1,82 +1,257 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Wire.h>
+#include <ESP32Servo.h>
 
 #include <Adafruit_MPU6050.h>
-#include <Adafruit_LSM303_U.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_Sensor.h>
 
-// WiFi access point
+// ======================================================
+// WIFI ACCESS POINT
+// ======================================================
 const char* ssid = "ESP32-DRONE";
 const char* password = "12345678";
 
 WebServer server(80);
 
-// Sensors
+// ======================================================
+// I2C PINS
+// ======================================================
+#define SDA_PIN 19
+#define SCL_PIN 18
+
+// ======================================================
+// SENSOR ADDRESSES
+// ======================================================
+#define MPU6050_ADDR 0x68
+#define BMP280_ADDR  0x76
+
+#define LSM303_ACC_ADDR 0x19
+#define LSM303_MAG_ADDR 0x1E
+
+// ======================================================
+// SENSOR OBJECTS
+// ======================================================
 Adafruit_MPU6050 mpu;
-Adafruit_LSM303_Mag_Unified mag = Adafruit_LSM303_Mag_Unified(30302);
 Adafruit_BMP280 bmp;
 
-// ESC pins
-#define FL 18
-#define FR 19
-#define RL 27
-#define RR 14
+// ======================================================
+// BMP STATUS
+// ======================================================
+bool bmpFound = false;
 
-#define PWM_FREQ 50
-#define PWM_RES 16
+// ======================================================
+// ESC PINS
+// ======================================================
+#define FL_PIN 25
+#define FR_PIN 26
+#define RL_PIN 27
+#define RR_PIN 14
 
-#define MIN_US 1000
-#define MAX_US 1500   // safe test range
+// ======================================================
+// ESC SETTINGS
+// ======================================================
+#define MIN_US     1000
+#define IDLE_US    1050
+#define MAX_US     2000
 
-int throttle = 1000;
-int pitch = 0;       // NEW control variable
+// ======================================================
+// CONTROL VARIABLES
+// ======================================================
+int throttle = MIN_US;
+int pitch = 0;
 
-float roll, yaw;
-float altitude;
-float groundAltitude;
+float altitude = 0;
+float groundAltitude = 0;
 
+// ======================================================
+// LSM303 RAW DATA
+// ======================================================
+int16_t lsmAccX, lsmAccY, lsmAccZ;
+int16_t lsmMagX, lsmMagY, lsmMagZ;
 
-// Convert ESC microseconds → PWM duty
-uint32_t usToDuty(int us)
-{
-  return map(us, 1000, 2000, 3276, 6553);
-}
+// ======================================================
+// SERVO OBJECTS
+// ======================================================
+Servo motorFL;
+Servo motorFR;
+Servo motorRL;
+Servo motorRR;
 
-
-// Write motor safely
-void writeMotor(int pin, int us)
+// ======================================================
+// WRITE MOTOR
+// ======================================================
+void writeMotor(Servo &motor, int us)
 {
   us = constrain(us, MIN_US, MAX_US);
-  ledcWrite(pin, usToDuty(us));
+  motor.writeMicroseconds(us);
 }
 
-
-// Motor mixing
+// ======================================================
+// MOTOR MIXER
+// ======================================================
 void updateMotors()
 {
   int FL_out = throttle - pitch;
   int FR_out = throttle - pitch;
+
   int RL_out = throttle + pitch;
   int RR_out = throttle + pitch;
 
-  writeMotor(FL, FL_out);
-  writeMotor(FR, FR_out);
-  writeMotor(RL, RL_out);
-  writeMotor(RR, RR_out);
+  writeMotor(motorFL, FL_out);
+  writeMotor(motorFR, FR_out);
+  writeMotor(motorRL, RL_out);
+  writeMotor(motorRR, RR_out);
+
+  Serial.println("======================");
+
+  Serial.print("FL: ");
+  Serial.println(FL_out);
+
+  Serial.print("FR: ");
+  Serial.println(FR_out);
+
+  Serial.print("RL: ");
+  Serial.println(RL_out);
+
+  Serial.print("RR: ");
+  Serial.println(RR_out);
 }
 
+// ======================================================
+// READ LSM303 ACCELEROMETER
+// ======================================================
+void readLSM303Accel()
+{
+  Wire.beginTransmission(LSM303_ACC_ADDR);
+  Wire.write(0x28 | 0x80);
 
-// Webpage UI
+  if(Wire.endTransmission(false) != 0)
+    return;
+
+  Wire.requestFrom(LSM303_ACC_ADDR, 6);
+
+  if(Wire.available() >= 6)
+  {
+    uint8_t xl = Wire.read();
+    uint8_t xh = Wire.read();
+
+    uint8_t yl = Wire.read();
+    uint8_t yh = Wire.read();
+
+    uint8_t zl = Wire.read();
+    uint8_t zh = Wire.read();
+
+    lsmAccX = (int16_t)(xh << 8 | xl);
+    lsmAccY = (int16_t)(yh << 8 | yl);
+    lsmAccZ = (int16_t)(zh << 8 | zl);
+  }
+}
+
+// ======================================================
+// READ LSM303 MAGNETOMETER
+// ======================================================
+void readLSM303Mag()
+{
+  Wire.beginTransmission(LSM303_MAG_ADDR);
+  Wire.write(0x68);
+
+  if(Wire.endTransmission(false) != 0)
+    return;
+
+  Wire.requestFrom(LSM303_MAG_ADDR, 6);
+
+  if(Wire.available() >= 6)
+  {
+    uint8_t xh = Wire.read();
+    uint8_t xl = Wire.read();
+
+    uint8_t yh = Wire.read();
+    uint8_t yl = Wire.read();
+
+    uint8_t zh = Wire.read();
+    uint8_t zl = Wire.read();
+
+    lsmMagX = (int16_t)(xh << 8 | xl);
+    lsmMagY = (int16_t)(yh << 8 | yl);
+    lsmMagZ = (int16_t)(zh << 8 | zl);
+  }
+}
+
+// ======================================================
+// INIT LSM303
+// ======================================================
+void initLSM303()
+{
+  // Accelerometer enable
+  Wire.beginTransmission(LSM303_ACC_ADDR);
+  Wire.write(0x20);
+  Wire.write(0x57);
+  Wire.endTransmission();
+
+  // Magnetometer continuous mode
+  Wire.beginTransmission(LSM303_MAG_ADDR);
+  Wire.write(0x02);
+  Wire.write(0x00);
+  Wire.endTransmission();
+}
+
+// ======================================================
+// ESC CALIBRATION
+// ======================================================
+void calibrateESCs()
+{
+  Serial.println("================================");
+  Serial.println("ESC CALIBRATION START");
+  Serial.println("DISCONNECT BATTERY NOW");
+  Serial.println("================================");
+
+  delay(5000);
+
+  // Send MAX throttle
+  motorFL.writeMicroseconds(MAX_US);
+  motorFR.writeMicroseconds(MAX_US);
+  motorRL.writeMicroseconds(MAX_US);
+  motorRR.writeMicroseconds(MAX_US);
+
+  Serial.println("CONNECT BATTERY NOW");
+  Serial.println("WAITING FOR BEEPS...");
+
+  delay(8000);
+
+  // Send MIN throttle
+  motorFL.writeMicroseconds(MIN_US);
+  motorFR.writeMicroseconds(MIN_US);
+  motorRL.writeMicroseconds(MIN_US);
+  motorRR.writeMicroseconds(MIN_US);
+
+  Serial.println("WAITING FOR CONFIRMATION BEEPS");
+
+  delay(8000);
+
+  Serial.println("ESC CALIBRATION COMPLETE");
+}
+
+// ======================================================
+// WEBPAGE
+// ======================================================
 String webpage = R"====(
 <!DOCTYPE html>
 <html>
+
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+
 <style>
-button{width:140px;height:60px;font-size:18px;margin:10px;}
+button{
+  width:140px;
+  height:60px;
+  font-size:18px;
+  margin:10px;
+}
 </style>
+
 </head>
 
 <body align="center">
@@ -93,12 +268,16 @@ button{width:140px;height:60px;font-size:18px;margin:10px;}
 
 <br><br>
 
+<button onclick="send('center')">Center</button>
+
+<br><br>
+
 <button onclick="send('stop')">STOP</button>
 
 <script>
 function send(cmd)
 {
- fetch("/control?cmd="+cmd);
+  fetch("/control?cmd=" + cmd);
 }
 </script>
 
@@ -106,28 +285,39 @@ function send(cmd)
 </html>
 )====";
 
-
-// Serve webpage
+// ======================================================
+// HANDLE ROOT
+// ======================================================
 void handleRoot()
 {
   server.send(200, "text/html", webpage);
 }
 
-
-// Handle commands
+// ======================================================
+// HANDLE CONTROL
+// ======================================================
 void handleControl()
 {
   String cmd = server.arg("cmd");
 
-  if(cmd == "throttle_up") throttle += 5;
-  if(cmd == "throttle_down") throttle -= 5;
+  if(cmd == "throttle_up")
+    throttle += 20;
 
-  if(cmd == "forward") pitch = 40;
-  if(cmd == "backward") pitch = -40;
+  if(cmd == "throttle_down")
+    throttle -= 20;
+
+  if(cmd == "forward")
+    pitch = 40;
+
+  if(cmd == "backward")
+    pitch = -40;
+
+  if(cmd == "center")
+    pitch = 0;
 
   if(cmd == "stop")
   {
-    throttle = 1000;
+    throttle = MIN_US;
     pitch = 0;
   }
 
@@ -135,83 +325,205 @@ void handleControl()
 
   updateMotors();
 
-  server.send(200,"text/plain","OK");
+  server.send(200, "text/plain", "OK");
 }
 
-
+// ======================================================
+// SETUP
+// ======================================================
 void setup()
 {
   Serial.begin(115200);
 
-  Wire.begin(21,22);
+  // ====================================================
+  // START I2C
+  // ====================================================
+  Wire.begin(SDA_PIN, SCL_PIN);
 
-  if(!mpu.begin())
+  delay(1000);
+
+  Serial.println("I2C STARTED");
+
+  // ====================================================
+  // INIT LSM303
+  // ====================================================
+  initLSM303();
+
+  Serial.println("LSM303 INITIALIZED");
+
+  // ====================================================
+  // MPU6050
+  // ====================================================
+  if(!mpu.begin(MPU6050_ADDR, &Wire))
   {
-    Serial.println("MPU6050 failed");
-    while(1);
+    Serial.println("MPU6050 FAILED");
+  }
+  else
+  {
+    Serial.println("MPU6050 OK");
   }
 
-  if(!mag.begin())
+  // ====================================================
+  // BMP280
+  // ====================================================
+  if(bmp.begin(BMP280_ADDR))
   {
-    Serial.println("Compass failed");
-    while(1);
+    Serial.println("BMP280 OK");
+    bmpFound = true;
+  }
+  else
+  {
+    Serial.println("BMP280 FAILED");
   }
 
-  if(!bmp.begin(0x76))
+  // ====================================================
+  // ALTITUDE CALIBRATION
+  // ====================================================
+  if(bmpFound)
   {
-    if(!bmp.begin(0x77))
-    {
-      Serial.println("BMP280 failed");
-      while(1);
-    }
+    groundAltitude = bmp.readAltitude(1013.25);
+
+    Serial.print("GROUND ALTITUDE: ");
+    Serial.println(groundAltitude);
   }
 
-  Serial.println("Sensors ready");
+  // ====================================================
+  // ATTACH ESCs
+  // ====================================================
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
 
-  delay(2000);
+  motorFL.setPeriodHertz(50);
+  motorFR.setPeriodHertz(50);
+  motorRL.setPeriodHertz(50);
+  motorRR.setPeriodHertz(50);
 
-  groundAltitude = bmp.readAltitude(1013.25);
+  motorFL.attach(FL_PIN, MIN_US, MAX_US);
+  motorFR.attach(FR_PIN, MIN_US, MAX_US);
+  motorRL.attach(RL_PIN, MIN_US, MAX_US);
+  motorRR.attach(RR_PIN, MIN_US, MAX_US);
 
-  // Attach ESC PWM
-  ledcAttach(FL, PWM_FREQ, PWM_RES);
-  ledcAttach(FR, PWM_FREQ, PWM_RES);
-  ledcAttach(RL, PWM_FREQ, PWM_RES);
-  ledcAttach(RR, PWM_FREQ, PWM_RES);
+  // ====================================================
+  // INITIAL MIN THROTTLE
+  // ====================================================
+  motorFL.writeMicroseconds(MIN_US);
+  motorFR.writeMicroseconds(MIN_US);
+  motorRL.writeMicroseconds(MIN_US);
+  motorRR.writeMicroseconds(MIN_US);
 
-  Serial.println("ESC arming...");
+  delay(5000);
 
-  for(int i=0;i<300;i++)
-  {
-    updateMotors();
-    delay(10);
-  }
+  // ====================================================
+  // OPTIONAL ESC CALIBRATION
+  // ====================================================
+  // Uncomment ONLY ONCE when calibrating ESCs
+  //
+  // calibrateESCs();
+  //
 
-  Serial.println("ESC ready");
+  Serial.println("ESC READY");
 
+  // ====================================================
+  // WIFI ACCESS POINT
+  // ====================================================
   WiFi.softAP(ssid, password);
 
-  Serial.print("Connect WiFi: ");
+  Serial.print("CONNECT WIFI: ");
   Serial.println(ssid);
 
-  Serial.print("Open browser: ");
+  Serial.print("OPEN BROWSER: ");
   Serial.println(WiFi.softAPIP());
 
+  // ====================================================
+  // SERVER ROUTES
+  // ====================================================
   server.on("/", handleRoot);
   server.on("/control", handleControl);
 
   server.begin();
+
+  Serial.println("WEB SERVER STARTED");
 }
 
-
+// ======================================================
+// LOOP
+// ======================================================
 void loop()
 {
   server.handleClient();
 
-  Serial.print("Throttle: ");
-  Serial.print(throttle);
+  // ====================================================
+  // MPU6050
+  // ====================================================
+  sensors_event_t a, g, temp;
 
-  Serial.print(" Pitch: ");
+  mpu.getEvent(&a, &g, &temp);
+
+  // ====================================================
+  // LSM303
+  // ====================================================
+  readLSM303Accel();
+  readLSM303Mag();
+
+  // ====================================================
+  // SENSOR OUTPUT
+  // ====================================================
+  Serial.println("======================");
+
+  Serial.print("Throttle: ");
+  Serial.println(throttle);
+
+  Serial.print("Pitch: ");
   Serial.println(pitch);
 
-  delay(100);
+  Serial.print("MPU Accel X: ");
+  Serial.println(a.acceleration.x);
+
+  Serial.print("MPU Accel Y: ");
+  Serial.println(a.acceleration.y);
+
+  Serial.print("MPU Accel Z: ");
+  Serial.println(a.acceleration.z);
+
+  Serial.print("Gyro X: ");
+  Serial.println(g.gyro.x);
+
+  Serial.print("Gyro Y: ");
+  Serial.println(g.gyro.y);
+
+  Serial.print("Gyro Z: ");
+  Serial.println(g.gyro.z);
+
+  Serial.print("LSM Accel X: ");
+  Serial.println(lsmAccX);
+
+  Serial.print("LSM Accel Y: ");
+  Serial.println(lsmAccY);
+
+  Serial.print("LSM Accel Z: ");
+  Serial.println(lsmAccZ);
+
+  Serial.print("Compass X: ");
+  Serial.println(lsmMagX);
+
+  Serial.print("Compass Y: ");
+  Serial.println(lsmMagY);
+
+  Serial.print("Compass Z: ");
+  Serial.println(lsmMagZ);
+
+  // ====================================================
+  // BMP280 ALTITUDE
+  // ====================================================
+  if(bmpFound)
+  {
+    altitude = bmp.readAltitude(1013.25) - groundAltitude;
+
+    Serial.print("Altitude: ");
+    Serial.println(altitude);
+  }
+
+  delay(500);
 }
